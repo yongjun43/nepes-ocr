@@ -1,0 +1,28 @@
+# data & outputs
+*.csv
+data/
+datasets/
+outputs/
+runs/
+wandb/
+
+# models/checkpoints
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+checkpoints/
+**/pytorch_model.bin
+**/optimizer.pt
+**/scheduler.pt
+
+# images (원하면 폴더 단위로)
+images/
+raw_images/
+aug_images/
+
+# python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
