@@ -85,7 +85,7 @@ def build_online_aug() -> A.Compose:
         A.ShiftScaleRotate(shift_limit=0.02, scale_limit=0.05, rotate_limit=0,
                            border_mode=cv2.BORDER_REFLECT_101, p=0.3),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
-        A.GaussNoise(var_limit=(10.0, 40.0), mean=0.0, p=0.3)
+        A.GaussNoise(std_range=(5/255.0, 18/255.0), mean_range=(0.0, 0.0), p=0.3),
         # 모션/다운업샘플은 필요 시 추가 가능
     ])
 
@@ -147,14 +147,14 @@ class DataCollatorForOCR:
 
         # 1) pad된 라벨(아직 -100 처리 전)
         labels_list = [b["labels"] for b in batch]
-        labels_pad = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=pad_id).long()
+        labels_pad = torch.nn.utils.rnn.pad_sequence(labels_list, batch_first=True, padding_value=pad_id)
 
         # 2) loss용 라벨: pad→-100
         labels_for_loss = labels_pad.clone()
         labels_for_loss[labels_for_loss == pad_id] = -100
 
         # 3) decoder_input_ids: shift-right
-        decoder_input_ids = self._shift_right(labels_pad, pad_id=pad_id, start_id=self.decoder_start_token_id).long()
+        decoder_input_ids = self._shift_right(labels_pad, pad_id=pad_id, start_id=self.decoder_start_token_id)
 
         return {
             "pixel_values": pixel_values,
@@ -200,16 +200,12 @@ class SerialPatternConstraint:
         # 단일 토큰을 디코딩했을 때 'N' 혹은 ' N' 처럼
         # 앞에 공백이 붙은 경우까지 모두 허용
         for tid in range(vocab_size):
-            # SerialPatternConstraint._build_char_to_ids_map 안에서
             s = self.tok.decode([tid], skip_special_tokens=True)
             if not s:
-                continue
-            if s.strip() == "":   # ← 공백만 있는 토큰 배제
                 continue
             s_stripped = s.lstrip()
             if len(s_stripped) == 1 and s_stripped in m:
                 m[s_stripped].append(tid)
-
 
         # 혹시 못 찾은 문자가 있으면 마지막으로 직접 encode fallback
         for ch in targets:
@@ -245,19 +241,24 @@ class SerialPatternConstraint:
         return ["<eos>"]
 
     def __call__(self, batch_id: int, input_ids: torch.LongTensor) -> List[int]:
+        # decode current text (skip specials)
         text = self.tok.decode(input_ids.tolist(), skip_special_tokens=True)
+        # strip any leading artifacts
         prefix = text.lstrip()
         allowed_chars = self._allowed_chars_at(prefix)
-
+        # If allowing EOS only (length reached)
         if allowed_chars == ["<eos>"]:
-            return self.char_to_ids["<eos>"]  # 길이 15 완성 후에만 EOS 허용
+            return self.char_to_ids["<eos>"]
 
+        # map chars -> union of token ids
         allowed_ids: List[int] = []
         for ch in allowed_chars:
-            allowed_ids.extend(self.char_to_ids.get(ch, []))
-        # ← 여기서 EOS 추가하지 않음
+            ids = self.char_to_ids.get(ch, [])
+            allowed_ids.extend(ids)
+        # Always allow EOS if we're at end-1 and model wants to finish early
+        allowed_ids.extend(self.char_to_ids["<eos>"])
+        # dedup
         return list(dict.fromkeys(allowed_ids))
-
 
 # --------------------------
 # Metrics (uses generated sequences)
@@ -340,7 +341,6 @@ def main():
     parser.add_argument("--use_constraint", action="store_true",
                         help="Enable regex-like constrained decoding (N-YYYY-MM-[BT]-ddd)")
     parser.add_argument("--train_fraction", type=float, default=0.8)
-    parser.add_argument("--num_beams", type=int, default=7)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -355,23 +355,25 @@ def main():
         if img_key is None or "label" not in reader.fieldnames:
             raise ValueError("CSV must contain columns: 'image_path' (or 'filename') and 'label'")
         for r in reader:
-            rows.append((r[img_key].strip(), r["label"].strip().upper()))
+            rows.append((r[img_key], r["label"]))
 
     # ---------------- Grouped Split (누수 차단) ----------------
     import re
     from collections import defaultdict
 
     def group_key_from_path(p: str) -> str:
-        import re, os
+        """증강 접미사를 떼고 '원본 basename'을 그룹 키로 사용."""
         name = os.path.splitext(os.path.basename(p))[0]
-        m = re.search(r'(image\d+)', name, flags=re.IGNORECASE)
-        if m: return m.group(1).lower()
-        name = re.sub(r'_rot\d+(?:\.\d+)?', '', name)   # rot75, rot15.0 등
-        name = re.sub(r'_ver[12]', '', name)            # ver1, ver2
-        name = re.sub(r'_crop$', '', name)              # crop
-        name = re.sub(r'(?:_base|_aug\d+|_bup|_bdown)$', '', name)
-        return name.lower()
-
+        # 증강에서 붙이는 접미사들: _base, _aug1, _aug2, ... , _bup, _bdown 등
+        # 필요하면 여기에 더 추가 (예: _gammaX, _motion 등)
+        pattern = re.compile(r'(?:_base|_aug\d+|_bup|_bdown)$')
+        # 여러 번 붙어 있을 수 있으니 반복 제거
+        while True:
+            new = pattern.sub('', name)
+            if new == name:
+                break
+            name = new
+        return name
 
     # 1) 그룹 만들기
     groups = defaultdict(list)
@@ -451,15 +453,15 @@ def main():
         save_total_limit=2,
         logging_steps=100,
         predict_with_generate=True,
-        generation_num_beams=args.num_beams,
+        generation_num_beams=5,
         generation_max_length=32,
         remove_unused_columns=False,
         fp16=(torch.cuda.is_available() and not args.no_fp16),
         gradient_checkpointing=True,
         load_best_model_at_end=True,
-        metric_for_best_model="eval_cer",
+        metric_for_best_model="cer",
         greater_is_better=False,
-        label_smoothing_factor=0.05,
+        label_smoothing_factor=0.1,
         max_grad_norm=1.0,
         dataloader_num_workers=4,
         report_to=["none"],
@@ -491,7 +493,7 @@ def main():
         train_dataset=train_ds,   # ← 여기 이름과 위에서 정의한 변수명이 일치해야 함
         eval_dataset=val_ds,      # ← 동일
         data_collator=collator,
-        tokenizer=processor.tokenizer,
+        tokenizer=processor,
         compute_metrics=metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
         prefix_allowed_tokens_fn=prefix_fn,
@@ -517,7 +519,7 @@ def constrained_generate(
     model: VisionEncoderDecoderModel,
     processor: TrOCRProcessor,
     image_bgr: np.ndarray,
-    num_beams: int = 7,
+    num_beams: int = 5,
 ) -> str:
     """
     One-off inference with the same preprocess and N-YYYY-MM-[BT]-ddd constraint.
