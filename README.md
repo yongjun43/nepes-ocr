@@ -41,8 +41,7 @@ Developed from **March 2025 ~ Present** to improve OCR accuracy on curved, refle
 
 ## 📂 Data Format
 
-- **CSV file**:
-
+- **CSV file**:  
 - **Preprocess pipeline**:
 1. CLAHE `(clip=4, tile=16)`
 2. Invert if mean pixel < 115
@@ -52,7 +51,31 @@ Same base image & its augmentations → same split (to prevent leakage)
 
 ---
 
-## 🚀 Training
+## 📊 OCR Dataset & Preprocessing
+
+- **Original**: NS2 45 + Lab 16 = 61  
+- **Usable**: 52 (NS2 9 removed due to damaged serials)
+- **Serials**: Front & back per carrier → 87 total serial number crops.
+
+1. **Data Expansion**
+ - "Double-side extraction" to maximize sample count.
+
+2. **1st Augmentation (Mild)**
+ - Preserve legibility:
+   - Shift, brightness/contrast, blur, sharpening, CLAHE.
+
+3. **2nd Augmentation (Curriculum)**
+ - Train with **gradually stronger augmentation** over epochs.
+
+4. **Synthetic Data Trials**
+ - **Char-level crops** → Reconstruct serials → 14.17% accuracy.
+ - **Synthetic serial generation from crops** → 69.1% accuracy.
+ - **OCR-A font synthetic data** → 37.5% accuracy.
+ - **Conclusion**: Original-based augmentation performed best.
+
+---
+
+## 🚀 Training 
 
 ```bash
 export TOKENIZERS_PARALLELISM=false
@@ -72,3 +95,9 @@ python train.py \
 --use_online_aug \
 --use_constraint
 
+## 📈 **Evaluation**
+python eval_sn.py \
+  --csv_path ./test.csv \
+  --model_path ./0811_trocr_large \
+  --beam_width 5 \
+  --constraint
